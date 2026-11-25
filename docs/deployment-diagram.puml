@@ -1,0 +1,101 @@
+@startuml deployment-diagram
+title Energy Management System - UML Deployment Diagram (Assignment 1 + Assignment 2 + Project P1)
+
+skinparam componentStyle rectangle
+skinparam shadowing false
+skinparam defaultTextAlignment center
+
+actor "Browser" as client
+
+node "User machine (desktop)" as desktop {
+  node "JVM 21" as simJvm {
+    component "Device Data Simulator\n(Swing desktop app, producer)\n10-minute readings as JSON" as simulator
+  }
+}
+
+node "Docker host" {
+
+  node "Docker network: ems_edge" as edge {
+    node "traefik:v3.6\n<<container>>" as proxyNode {
+      component "Reverse Proxy\n(Traefik routers)" as proxy
+      component "Validation\n(forwardAuth middleware)" as validation
+    }
+    node "frontend\n<<container nginx>>" as frontNode {
+      component "Web client\n(React SPA, charts)" as front
+    }
+    node "auth-service\n<<container>>" as authNode {
+      component "Authorization Service\n(Spring Boot, JWT)" as authSvc
+    }
+    node "user-service\n<<container>>" as userNode {
+      component "User Management\nMicroservice\n(Spring Boot, REST)" as userSvc
+    }
+    node "device-service\n<<container>>" as deviceNode {
+      component "Device Management\nMicroservice\n(Spring Boot, REST)" as deviceSvc
+    }
+    node "monitoring-service\n<<container>>" as monNode {
+      component "Monitoring Microservice\n(Spring Boot, REST +\nmessage consumer)" as monSvc
+    }
+  }
+
+  node "Docker network: ems_sync_mq" as syncNet {
+    node "sync-broker\n<<container rabbitmq:3.13>>" as syncNode {
+      queue "Synchronization Broker\ntopic exchange 'sync.events'\nsync.device-service.users  (user.*)\nsync.monitoring-service.devices  (device.*)" as syncBroker
+    }
+  }
+
+  node "Docker network: ems_data_mq" as dataNet {
+    node "data-broker\n<<container rabbitmq:3.13>>" as dataNode {
+      queue "Data Collection Broker\nqueue 'device-measurements'" as dataBroker
+    }
+  }
+
+  node "Docker network: ems_auth_data" as ad {
+    node "auth-db\n<<container postgres:16>>" as authDbNode {
+      database "Credential Database" as authDb
+    }
+  }
+  node "Docker network: ems_user_data" as ud {
+    node "user-db\n<<container postgres:16>>" as userDbNode {
+      database "User Database" as userDb
+    }
+  }
+  node "Docker network: ems_device_data" as dd {
+    node "device-db\n<<container postgres:16>>" as deviceDbNode {
+      database "Device Database\n(devices + user_refs)" as deviceDb
+    }
+  }
+  node "Docker network: ems_monitoring_data" as md {
+    node "monitoring-db\n<<container postgres:16>>" as monDbNode {
+      database "Monitoring Database\n(device_refs, measurements,\nhourly_consumption)" as monDb
+    }
+  }
+}
+
+client --> proxy : HTTP :80 (only published HTTP port)
+proxy --> front : "/"  (priority 1)
+proxy --> authSvc : POST /api/auth/login\nPOST /api/auth/register\n(public)
+proxy --> validation : every request to /api/users, /api/devices\nand /api/monitoring (path prefixes)
+validation ..> authSvc : GET /api/auth/validate\nBearer token + X-Forwarded-Method/Uri\n200 + X-User-* | 401 | 403
+proxy --> userSvc : /api/users (prefix)\n(only if validated)
+proxy --> deviceSvc : /api/devices (prefix)\n(only if validated)
+proxy --> monSvc : /api/monitoring (prefix)\n(only if validated)
+
+authSvc --> authDb : JDBC :5432
+userSvc --> userDb : JDBC :5432
+deviceSvc --> deviceDb : JDBC :5432
+monSvc --> monDb : JDBC :5432
+
+userSvc ..> authSvc : PUT/DELETE /internal/credentials/{id}\n(keep credentials in sync)
+authSvc ..> userSvc : POST /api/users\n(self-registration)
+deviceSvc ..> userSvc : GET /api/users/{id}\n(fallback only)
+
+' ---- Assignment 2: asynchronous communication
+simulator --> dataBroker : AMQP :5672 (published port)\n<timestamp, device_id, measurement_value>
+dataBroker --> monSvc : consume (point-to-point queue)\nhourly totals are stored
+
+userSvc --> syncBroker : publish user.created / updated / deleted
+deviceSvc --> syncBroker : publish device.created / updated / deleted
+syncBroker --> deviceSvc : consume user.*\n(user id stored locally)
+syncBroker --> monSvc : consume device.*\n(device id + owner stored locally)
+
+@enduml

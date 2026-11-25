@@ -1,0 +1,327 @@
+# Energy Management System - Assignment 1 + Assignment 2 + Project P1
+# Reverse proxy / API gateway (Traefik + forwardAuth) + Frontend + Authentication, User, Device and Monitoring services,
+# one PostgreSQL database per service, two RabbitMQ brokers (synchronization + data collection).
+# The proxy is the only published HTTP entry point (plus the data broker's AMQP port for the desktop simulator).
+
+services:
+  # ---------------------------------------------------------------- reverse proxy
+  traefik:
+    image: traefik:v3.6
+    container_name: ems-traefik
+    restart: unless-stopped
+    command:
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false   # only containers with traefik.enable=true are routed
+      - --providers.docker.network=ems_edge
+      - --entrypoints.web.address=:80
+      - --api.dashboard=true
+      - --api.insecure=true                         # dashboard on :8080 inside the container (dev only)
+    ports:
+      - "${GATEWAY_PORT:-80}:80"                    # the ONLY entry point to the system
+      - "${TRAEFIK_DASHBOARD_PORT:-8090}:8080"      # Traefik dashboard
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - edge
+
+  # ---------------------------------------------------------------- authentication microservice
+  auth-service:
+    build: ./auth-service
+    container_name: ems-auth-service
+    restart: unless-stopped
+    environment:
+      DB_URL: jdbc:postgresql://auth-db:5432/${AUTH_DB_NAME}
+      DB_USER: ${AUTH_DB_USER}
+      DB_PASSWORD: ${AUTH_DB_PASSWORD}
+      USER_SERVICE_URL: http://user-service:8080
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_EXPIRATION_MINUTES: ${JWT_EXPIRATION_MINUTES:-60}
+    depends_on:
+      auth-db:
+        condition: service_healthy
+    labels:
+      - traefik.enable=true
+      # forwardAuth middleware = the "Validation" box of the API gateway: Traefik asks this endpoint before
+      # forwarding any request and copies the identity headers it returns to the upstream request.
+      - traefik.http.middlewares.ems-auth.forwardauth.address=http://auth-service:8080/api/auth/validate
+      - traefik.http.middlewares.ems-auth.forwardauth.authResponseHeaders=X-User-Id,X-User-Name,X-User-Role
+      # public routes only: login, register and the API documentation. /api/auth/validate and /internal are NOT routed.
+      - traefik.http.routers.auth.rule=PathPrefix(`/api/auth/login`) || PathPrefix(`/api/auth/register`) || PathPrefix(`/api/auth/swagger-ui`) || PathPrefix(`/api/auth/v3/api-docs`)
+      - traefik.http.routers.auth.entrypoints=web
+      - traefik.http.routers.auth.priority=100
+      - traefik.http.services.auth.loadbalancer.server.port=8080
+    networks:
+      - edge
+      - auth_data
+
+  auth-db:
+    image: postgres:16-alpine
+    container_name: ems-auth-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${AUTH_DB_NAME}
+      POSTGRES_USER: ${AUTH_DB_USER}
+      POSTGRES_PASSWORD: ${AUTH_DB_PASSWORD}
+    volumes:
+      - auth-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U ${AUTH_DB_USER} -d ${AUTH_DB_NAME}" ]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - auth_data
+
+  # ---------------------------------------------------------------- user microservice
+  user-service:
+    build: ./user-service
+    container_name: ems-user-service
+    restart: unless-stopped
+    environment:
+      DB_URL: jdbc:postgresql://user-db:5432/${USER_DB_NAME}
+      DB_USER: ${USER_DB_USER}
+      DB_PASSWORD: ${USER_DB_PASSWORD}
+      AUTH_SERVICE_URL: http://auth-service:8080
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD}
+      SYNC_MQ_HOST: sync-broker
+      SYNC_MQ_PORT: 5672
+      SYNC_MQ_USER: ${SYNC_MQ_USER}
+      SYNC_MQ_PASSWORD: ${SYNC_MQ_PASSWORD}
+    depends_on:
+      user-db:
+        condition: service_healthy
+      sync-broker:
+        condition: service_healthy
+    labels:
+      - traefik.enable=true
+      # protected API: every request is validated by the gateway (forwardAuth -> auth-service)
+      - traefik.http.routers.user.rule=PathPrefix(`/api/users`)
+      - traefik.http.routers.user.entrypoints=web
+      - traefik.http.routers.user.middlewares=ems-auth@docker
+      - traefik.http.routers.user.service=user
+      # Swagger UI and the OpenAPI document stay public (higher priority than the protected router)
+      - traefik.http.routers.user-docs.rule=PathPrefix(`/api/users/swagger-ui`) || PathPrefix(`/api/users/v3/api-docs`)
+      - traefik.http.routers.user-docs.entrypoints=web
+      - traefik.http.routers.user-docs.priority=100
+      - traefik.http.routers.user-docs.service=user
+      - traefik.http.services.user.loadbalancer.server.port=8080
+    networks:
+      - edge
+      - user_data
+      - sync_mq
+
+  user-db:
+    image: postgres:16-alpine
+    container_name: ems-user-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${USER_DB_NAME}
+      POSTGRES_USER: ${USER_DB_USER}
+      POSTGRES_PASSWORD: ${USER_DB_PASSWORD}
+    volumes:
+      - user-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U ${USER_DB_USER} -d ${USER_DB_NAME}" ]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - user_data
+
+  # ---------------------------------------------------------------- device microservice
+  device-service:
+    build: ./device-service
+    container_name: ems-device-service
+    restart: unless-stopped
+    environment:
+      DB_URL: jdbc:postgresql://device-db:5432/${DEVICE_DB_NAME}
+      DB_USER: ${DEVICE_DB_USER}
+      DB_PASSWORD: ${DEVICE_DB_PASSWORD}
+      USER_SERVICE_URL: http://user-service:8080
+      SYNC_MQ_HOST: sync-broker
+      SYNC_MQ_PORT: 5672
+      SYNC_MQ_USER: ${SYNC_MQ_USER}
+      SYNC_MQ_PASSWORD: ${SYNC_MQ_PASSWORD}
+    depends_on:
+      device-db:
+        condition: service_healthy
+      sync-broker:
+        condition: service_healthy
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.device.rule=PathPrefix(`/api/devices`)
+      - traefik.http.routers.device.entrypoints=web
+      - traefik.http.routers.device.middlewares=ems-auth@docker
+      - traefik.http.routers.device.service=device
+      - traefik.http.routers.device-docs.rule=PathPrefix(`/api/devices/swagger-ui`) || PathPrefix(`/api/devices/v3/api-docs`)
+      - traefik.http.routers.device-docs.entrypoints=web
+      - traefik.http.routers.device-docs.priority=100
+      - traefik.http.routers.device-docs.service=device
+      - traefik.http.services.device.loadbalancer.server.port=8080
+    networks:
+      - edge
+      - device_data
+      - sync_mq
+
+  device-db:
+    image: postgres:16-alpine
+    container_name: ems-device-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DEVICE_DB_NAME}
+      POSTGRES_USER: ${DEVICE_DB_USER}
+      POSTGRES_PASSWORD: ${DEVICE_DB_PASSWORD}
+    volumes:
+      - device-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U ${DEVICE_DB_USER} -d ${DEVICE_DB_NAME}" ]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - device_data
+
+  # ---------------------------------------------------------------- monitoring microservice (Assignment 2)
+  monitoring-service:
+    build: ./monitoring-service
+    container_name: ems-monitoring-service
+    restart: unless-stopped
+    environment:
+      DB_URL: jdbc:postgresql://monitoring-db:5432/${MONITORING_DB_NAME}
+      DB_USER: ${MONITORING_DB_USER}
+      DB_PASSWORD: ${MONITORING_DB_PASSWORD}
+      SYNC_MQ_HOST: sync-broker
+      SYNC_MQ_PORT: 5672
+      SYNC_MQ_USER: ${SYNC_MQ_USER}
+      SYNC_MQ_PASSWORD: ${SYNC_MQ_PASSWORD}
+      DATA_MQ_HOST: data-broker
+      DATA_MQ_PORT: 5672
+      DATA_MQ_USER: ${DATA_MQ_USER}
+      DATA_MQ_PASSWORD: ${DATA_MQ_PASSWORD}
+    depends_on:
+      monitoring-db:
+        condition: service_healthy
+      sync-broker:
+        condition: service_healthy
+      data-broker:
+        condition: service_healthy
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.monitoring.rule=PathPrefix(`/api/monitoring`)
+      - traefik.http.routers.monitoring.entrypoints=web
+      - traefik.http.routers.monitoring.middlewares=ems-auth@docker
+      - traefik.http.routers.monitoring.service=monitoring
+      - traefik.http.routers.monitoring-docs.rule=PathPrefix(`/api/monitoring/swagger-ui`) || PathPrefix(`/api/monitoring/v3/api-docs`)
+      - traefik.http.routers.monitoring-docs.entrypoints=web
+      - traefik.http.routers.monitoring-docs.priority=100
+      - traefik.http.routers.monitoring-docs.service=monitoring
+      - traefik.http.services.monitoring.loadbalancer.server.port=8080
+    networks:
+      - edge
+      - monitoring_data
+      - sync_mq
+      - data_mq
+
+  monitoring-db:
+    image: postgres:16-alpine
+    container_name: ems-monitoring-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${MONITORING_DB_NAME}
+      POSTGRES_USER: ${MONITORING_DB_USER}
+      POSTGRES_PASSWORD: ${MONITORING_DB_PASSWORD}
+    volumes:
+      - monitoring-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U ${MONITORING_DB_USER} -d ${MONITORING_DB_NAME}" ]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - monitoring_data
+
+
+  # ---------------------------------------------------------------- message brokers (Assignment 2)
+  # Synchronization Broker: user/device events (topic exchange "sync.events", one queue per consuming service).
+  # No AMQP port is published: only containers on the sync_mq network can reach it.
+  sync-broker:
+    image: rabbitmq:3.13-management-alpine
+    container_name: ems-sync-broker
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${SYNC_MQ_USER}
+      RABBITMQ_DEFAULT_PASS: ${SYNC_MQ_PASSWORD}
+    ports:
+      - "${SYNC_MQ_MANAGEMENT_PORT:-15672}:15672"
+    volumes:
+      - sync-broker-data:/var/lib/rabbitmq
+    healthcheck:
+      test: [ "CMD", "rabbitmq-diagnostics", "-q", "check_port_connectivity" ]
+      interval: 10s
+      timeout: 15s
+      retries: 15
+      start_period: 45s
+    networks:
+      - sync_mq
+
+  # Data Collection Broker: queue "device-measurements" written by the Device Data Simulator (desktop application
+  # on the host, so the AMQP port is published) and read by the Monitoring service.
+  data-broker:
+    image: rabbitmq:3.13-management-alpine
+    container_name: ems-data-broker
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${DATA_MQ_USER}
+      RABBITMQ_DEFAULT_PASS: ${DATA_MQ_PASSWORD}
+    ports:
+      - "${DATA_MQ_PORT:-5672}:5672"
+      - "${DATA_MQ_MANAGEMENT_PORT:-15673}:15672"
+    volumes:
+      - data-broker-data:/var/lib/rabbitmq
+    healthcheck:
+      test: [ "CMD", "rabbitmq-diagnostics", "-q", "check_port_connectivity" ]
+      interval: 10s
+      timeout: 15s
+      retries: 15
+      start_period: 45s
+    networks:
+      - data_mq
+
+  # ---------------------------------------------------------------- web client
+  frontend:
+    build: ./frontend
+    container_name: ems-frontend
+    restart: unless-stopped
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.frontend.rule=PathPrefix(`/`)
+      - traefik.http.routers.frontend.entrypoints=web
+      - traefik.http.routers.frontend.priority=1      # lowest: every /api/** router wins over it
+      - traefik.http.services.frontend.loadbalancer.server.port=80
+    networks:
+      - edge
+
+volumes:
+  auth-db-data:
+  user-db-data:
+  device-db-data:
+  monitoring-db-data:
+  sync-broker-data:
+  data-broker-data:
+
+networks:
+  edge: # proxy <-> services (and service <-> service)
+    name: ems_edge
+  auth_data: # auth-service <-> auth-db only
+    name: ems_auth_data
+  user_data: # user-service <-> user-db only
+    name: ems_user_data
+  device_data: # device-service <-> device-db only
+    name: ems_device_data
+  monitoring_data: # monitoring-service <-> monitoring-db only
+    name: ems_monitoring_data
+  sync_mq: # Synchronization Broker <-> user / device / monitoring services
+    name: ems_sync_mq
+  data_mq: # Data Collection Broker <-> monitoring service
+    name: ems_data_mq
